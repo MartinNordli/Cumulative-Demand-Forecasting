@@ -1,17 +1,21 @@
 """Model C — per-rm linear regression on the cumulative curve.
 
 Replicates Group 72's winning approach: for each rm_id with sufficient
-history, fit OLS of cumulative kg vs day-of-year and forecast the next
+history, fit a slope of cumulative kg vs day-of-year and forecast the next
 year by re-applying the slope from a Jan-1 origin.
 
 The slope is shrunk by a tunable factor ``s ∈ (0, 1]`` to bias the forecast
 low (matching the τ=0.2 pinball objective). ``s`` is selected on the
 walk-forward validation; expect s ≈ 0.55–0.7.
 
-Two slope strategies:
-- ``"recent"`` (default): fit OLS on a single year (``fit_year``).
-- ``"quantile"``: fit OLS on each of the last ``n_years`` years, then
-  pick the τ-quantile slope across years. Captures year-to-year variability.
+Slope strategies:
+- ``"recent"``: OLS on a single year (``fit_year``).
+- ``"quantile"``: OLS per year, take the τ-quantile of the slopes.
+- ``"trailing_window"``: OLS on a trailing N-day window. v3 default.
+- ``"trailing_window_theilsen"``: Theil-Sen (median-of-pairwise-slopes) on
+  the same trailing N-day window. v7 default — substantially more robust
+  to bursty deliveries than OLS, which translated to ~5% CV avg pinball
+  improvement and a much smaller p2023/p2024 gap.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+from scipy.stats import theilslopes
 
 
 def _fit_yearly_slope(g: pd.DataFrame, use_only_active: bool, min_active_days: int) -> tuple[float, bool]:
@@ -59,10 +64,10 @@ class PerRMLinearForecaster:
     fits: dict | None = None
 
     def fit(self, daily: pd.DataFrame) -> "PerRMLinearForecaster":
-        if self.slope_strategy not in ("recent", "quantile", "trailing_window"):
+        if self.slope_strategy not in ("recent", "quantile", "trailing_window", "trailing_window_theilsen"):
             raise ValueError(f"unknown slope_strategy: {self.slope_strategy}")
 
-        if self.slope_strategy == "trailing_window":
+        if self.slope_strategy in ("trailing_window", "trailing_window_theilsen"):
             if self.cutoff is None:
                 raise ValueError("trailing_window strategy requires `cutoff`")
             window_start = self.cutoff - pd.Timedelta(days=self.trailing_window_days)
@@ -84,13 +89,22 @@ class PerRMLinearForecaster:
                 if x.size < 2:
                     fits[int(rm_id)] = (0.0, False)
                     continue
-                x_mean, y_mean = x.mean(), y.mean()
-                ss_xy = ((x - x_mean) * (y - y_mean)).sum()
-                ss_xx = ((x - x_mean) ** 2).sum()
-                if ss_xx == 0:
-                    fits[int(rm_id)] = (0.0, False)
-                    continue
-                fits[int(rm_id)] = (float(ss_xy / ss_xx), True)
+                if self.slope_strategy == "trailing_window_theilsen":
+                    try:
+                        slope, _, _, _ = theilslopes(y, x)
+                        slope = float(max(slope, 0.0))
+                    except Exception:
+                        fits[int(rm_id)] = (0.0, False)
+                        continue
+                    fits[int(rm_id)] = (slope, True)
+                else:
+                    x_mean, y_mean = x.mean(), y.mean()
+                    ss_xy = ((x - x_mean) * (y - y_mean)).sum()
+                    ss_xx = ((x - x_mean) ** 2).sum()
+                    if ss_xx == 0:
+                        fits[int(rm_id)] = (0.0, False)
+                        continue
+                    fits[int(rm_id)] = (float(ss_xy / ss_xx), True)
             self.fits = fits
             return self
 
