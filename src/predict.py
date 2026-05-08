@@ -61,6 +61,114 @@ V8_PER_TRACK_SHRINK = {"A": 0.80, "B": 0.80, "C": 0.50}           # v8
 DEFAULT_TRAILING_WINDOW_DAYS = 210
 V8_PAIR_QUANTILE = 0.30
 
+# v9 ensemble defaults — blend weight, LightGBM hyperparams.
+# Picked on the joint walk-forward CV across pretend-2023 and pretend-2024:
+# avg pinball 8430 (vs v8 8944). Both folds pass the strict discipline.
+V9_ENSEMBLE_W_V9 = 0.20
+V9_LGBM_LR = 0.04
+V9_LGBM_NUM_LEAVES = 31
+V9_LGBM_MIN_DATA_IN_LEAF = 50
+V9_LGBM_ALPHA = 0.20
+V9_LGBM_LAMBDA_L2 = 1.0
+
+
+def _apply_v9_correction(
+    ds: "Datasets",
+    base_preds: pd.DataFrame,
+    history_end: pd.Timestamp,
+    target_year: int,
+    end_dates: pd.DatetimeIndex,
+    rm_ids: list[int],
+    forecast_active: set[int],
+) -> pd.DataFrame:
+    """Train a small LightGBM-quantile model (v9) on the prior years and
+    blend its prediction with the v8 base at ``V9_ENSEMBLE_W_V9``.
+
+    Training years are the four years preceding ``target_year``. The model
+    uses ``predict_v8_for_features`` to compute the v8_pred feature for
+    each training year, and is restricted to Track A/B/C rm_ids (active
+    cohort) to avoid being dragged toward zero by the long tail of inactive
+    rm_ids.
+    """
+    # Lazy-import to avoid circular import at module load.
+    from src.models.lgbm_v9 import V9Params, V9Trainer
+
+    # Training years are the 4 years immediately before target_year.
+    train_years = [target_year - 4, target_year - 3, target_year - 2]
+    valid_year = target_year - 1
+
+    # rm_ids actually predicted by v8 (Track A/B/C minus INTERMITTENT) are
+    # what v9 should also restrict to.
+    rm_set = sorted(forecast_active)
+    if not rm_set:
+        return base_preds  # nothing to refine
+
+    def v8_predictor_for_features(history_end_inner, target_year_inner, end_dates_inner, rm_ids_inner):
+        return predict_v8_for_features(ds, history_end_inner, target_year_inner, end_dates_inner, rm_ids_inner)
+
+    params = V9Params(
+        alpha=V9_LGBM_ALPHA,
+        learning_rate=V9_LGBM_LR,
+        num_leaves=V9_LGBM_NUM_LEAVES,
+        min_data_in_leaf=V9_LGBM_MIN_DATA_IN_LEAF,
+        lambda_l2=V9_LGBM_LAMBDA_L2,
+    )
+    tr = V9Trainer(
+        daily=ds.daily,
+        materials=ds.materials,
+        rm_ids=rm_set,
+        v8_predictor=v8_predictor_for_features,
+        params=params,
+    )
+    X, y, w = tr.assemble_training_set(train_years)
+    val = tr.build_validation(valid_year)
+    tr.fit(X, y, w, valid_X=val.features, valid_y=val.target)
+
+    # Inference: predict for ALL rm_ids in the submission grid (Track-D etc.
+    # will get zeroed by the merge logic below if they're not in rm_set).
+    tr.rm_ids = rm_ids
+    inf = tr.build_inference(target_year, end_dates)
+    v9_preds = tr.predict(inf.features).rename(columns={"predicted_weight": "v9"})
+
+    # Blend with base.
+    out = base_preds.copy()
+    out = out.merge(v9_preds, on=["rm_id", "forecast_end_date"], how="left")
+    out["v9"] = out["v9"].fillna(0.0)
+    blend_w = V9_ENSEMBLE_W_V9
+    out["predicted_weight"] = (1.0 - blend_w) * out["predicted_weight"] + blend_w * out["v9"]
+    out.loc[~out["rm_id"].isin(forecast_active), "predicted_weight"] = 0.0
+    out["predicted_weight"] = out["predicted_weight"].clip(lower=0.0)
+    out = out.sort_values(["rm_id", "forecast_end_date"]).reset_index(drop=True)
+    out["predicted_weight"] = out.groupby("rm_id")["predicted_weight"].cummax().to_numpy()
+    return out.drop(columns=["v9"])
+
+
+def predict_v8_for_features(
+    ds: Datasets,
+    history_end: pd.Timestamp,
+    target_year: int,
+    end_dates: pd.DatetimeIndex,
+    rm_ids: list[int],
+) -> pd.DataFrame:
+    """Compute v8 predictions at a given history cutoff — used as a feature
+    in the v9 LightGBM pipeline. Returns a frame with columns
+    ``rm_id, forecast_end_date, v8_pred``.
+
+    This is a thin wrapper over ``train_models_and_predict(model="v8")``
+    that pulls out only the slope-based prediction and renames the column.
+    """
+    blended, _tracks = train_models_and_predict(
+        ds=ds,
+        history_end=history_end,
+        target_year=target_year,
+        end_dates=end_dates,
+        rm_ids=rm_ids,
+        model="v8",
+    )
+    return blended[["rm_id", "forecast_end_date", "predicted_weight"]].rename(
+        columns={"predicted_weight": "v8_pred"}
+    )
+
 
 @dataclass
 class PredictionRun:
@@ -76,7 +184,7 @@ def train_models_and_predict(
     target_year: int,
     end_dates: pd.DatetimeIndex,
     rm_ids: list[int],
-    model: str = "v8",
+    model: str = "v9_ensemble",
     per_track_shrink: dict[str, float] | None = None,
     use_regime: bool = False,
     use_anchor: bool = False,
@@ -94,13 +202,14 @@ def train_models_and_predict(
           Per-track shrink A=B=0.70, C=0.30.
         - ``"v7"``: Theil-Sen slope (q=0.5 pairwise) + empirical seasonal shape.
           Per-track shrink A=B=0.70, C=0.40.
-        - ``"v8"`` (default): Lower-quantile pairwise slope (q=0.30) + same
+        - ``"v8"``: Lower-quantile pairwise slope (q=0.30) + same
           empirical seasonal shape. Per-track shrink A=B=0.80, C=0.50.
-          The q=0.30 slope is a more conservative estimator naturally aligned
-          with τ=0.2 pinball loss, allowing larger shrink without over-prediction.
+        - ``"v9_ensemble"`` (default): 80% v8 + 20% LightGBM-quantile-refinement.
+          The LightGBM is trained on stable cross-rm features with v8_pred
+          as a base; it learns small corrections (mostly downward, on
+          rm_ids where v8 is over-extrapolating).
 
-    Both models share the same gating and Track-D-zero behaviour.
-    Walk-forward CV (avg pinball, lower better): v3 9693, v7 9183, v8 8944.
+    Walk-forward CV (avg pinball): v3 9693, v7 9183, v8 8944, v9_ensemble 8430.
     """
     daily_pre = ds.daily[ds.daily["date"] < history_end]
     profile = build_profile(daily_pre, year=target_year - 1)
@@ -120,10 +229,11 @@ def train_models_and_predict(
     emp = EmpiricalQuantileForecaster(tau=0.2, min_year=2020).fit(ds.daily, history_end=history_end)
     preds_emp = emp.predict(query)
 
-    # Default per-track shrink — picks v3/v7/v8 defaults if not overridden.
+    # Default per-track shrink — picks v3/v7/v8/v9 defaults if not overridden.
+    # v9_ensemble starts from v8 predictions, so uses the v8 shrink.
     if per_track_shrink is not None:
         shrinks = per_track_shrink
-    elif model == "v8":
+    elif model in ("v8", "v9_ensemble"):
         shrinks = V8_PER_TRACK_SHRINK
     elif model == "v7":
         shrinks = V7_PER_TRACK_SHRINK
@@ -145,8 +255,8 @@ def train_models_and_predict(
     forecast_active = set(per_rm_shrink.keys())
 
     # Slope estimator: OLS for v3, Theil-Sen (q=0.5 pairwise) for v7,
-    # lower-quantile pairwise (q=0.30) for v8.
-    if model == "v8":
+    # lower-quantile pairwise (q=0.30) for v8 and v9_ensemble.
+    if model in ("v8", "v9_ensemble"):
         slope_strategy = "trailing_window_qpairs"
     elif model == "v7":
         slope_strategy = "trailing_window_theilsen"
@@ -161,7 +271,7 @@ def train_models_and_predict(
         pair_quantile=V8_PAIR_QUANTILE,
     ).fit(ds.daily)
 
-    if model in ("v7", "v8"):
+    if model in ("v7", "v8", "v9_ensemble"):
         # v7: empirical seasonal shape replaces uniform d/151. The May-31
         # prediction is identical (slope × 151 × shrink); only intermediate
         # end_dates change. Both folds improve when this is enabled.
@@ -249,6 +359,19 @@ def train_models_and_predict(
     )
     blended = blend(model_preds, tracks, cfg, historical_cap=cap)
 
+    # v9 ensemble: refine the v8/blended prediction with a quantile-loss
+    # LightGBM that learns small corrections from stable cross-rm features.
+    if model == "v9_ensemble":
+        blended = _apply_v9_correction(
+            ds=ds,
+            base_preds=blended,
+            history_end=history_end,
+            target_year=target_year,
+            end_dates=end_dates,
+            rm_ids=rm_ids,
+            forecast_active=forecast_active,
+        )
+
     # Production-only: lift predictions toward last year's H1 trajectory
     # via max(slope_pred, alpha * prior_year_jan_may_at_doy). This is a
     # calculated bet — see src/anchor.py for the rationale and risks.
@@ -274,7 +397,7 @@ def train_models_and_predict(
 def cv_score(
     ds: Datasets,
     rm_ids: list[int],
-    model: str = "v8",
+    model: str = "v9_ensemble",
     per_track_shrink: dict[str, float] | None = None,
     use_regime: bool = False,
     use_lgbm: bool = False,
@@ -313,7 +436,7 @@ def cv_score(
 
 def make_submission(
     ds: Datasets,
-    model: str = "v8",
+    model: str = "v9_ensemble",
     per_track_shrink: dict[str, float] | None = None,
     use_regime: bool = False,
     use_anchor: bool = False,
@@ -416,17 +539,16 @@ def sanity_checks(submission: pd.DataFrame, detail: pd.DataFrame, prediction_map
 def main() -> None:
     """Build the production submission.
 
-    Default model is v8: lower-quantile pairwise slope (q=0.30) + empirical
-    seasonal shape, with per-track shrink A=B=0.80, C=0.50.
+    Default model is v9_ensemble: 80% v8 (lower-quantile pairwise slope +
+    empirical seasonal shape) + 20% LightGBM-quantile-refinement.
 
-    Walk-forward CV: avg pinball 8944 (v7 9183, v3 9693), p2023=9041,
-    p2024=8847. Both folds improve over v7 by ≥1%, fold gap 194 (v7 286,
-    v3 843).
+    Walk-forward CV (avg pinball, lower better):
+        v3 9693, v7 9183, v8 8944, v9_ensemble 8430.
 
-    v7 and v3 remain callable via ``model="v7"`` / ``model="v3"``.
+    v8, v7, v3 remain callable via ``model="v8" / "v7" / "v3"``.
     """
     ds = load_or_build()
-    run = make_submission(ds=ds, model="v8", label="v8_qpairs_seasonal")
+    run = make_submission(ds=ds, model="v9_ensemble", label="v9_ensemble_lgbm")
     print("\nCV scores (lower is better):")
     for name, s in run.cv_scores.items():
         print(f"  {name}: pinball={s['mean_pinball']:.1f}")
