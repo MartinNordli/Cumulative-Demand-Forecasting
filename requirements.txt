@@ -1,0 +1,14 @@
+pandas>=2.2
+numpy>=1.26,<3
+scikit-learn>=1.4
+lightgbm>=4.3
+optuna>=3.6
+pyarrow>=15
+matplotlib>=3.8
+seaborn>=0.13
+jupyter
+ipykernel
+tqdm>=4.66
+torch>=2.1
+pytorch-lightning>=2.2
+neuralforecast>=1.7
