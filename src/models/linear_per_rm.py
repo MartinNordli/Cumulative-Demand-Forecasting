@@ -1,17 +1,24 @@
 """Model C — per-rm linear regression on the cumulative curve.
 
 Replicates Group 72's winning approach: for each rm_id with sufficient
-history, fit OLS of cumulative kg vs day-of-year and forecast the next
+history, fit a slope of cumulative kg vs day-of-year and forecast the next
 year by re-applying the slope from a Jan-1 origin.
 
 The slope is shrunk by a tunable factor ``s ∈ (0, 1]`` to bias the forecast
 low (matching the τ=0.2 pinball objective). ``s`` is selected on the
 walk-forward validation; expect s ≈ 0.55–0.7.
 
-Two slope strategies:
-- ``"recent"`` (default): fit OLS on a single year (``fit_year``).
-- ``"quantile"``: fit OLS on each of the last ``n_years`` years, then
-  pick the τ-quantile slope across years. Captures year-to-year variability.
+Slope strategies:
+- ``"recent"``: OLS on a single year (``fit_year``).
+- ``"quantile"``: OLS per year, take the τ-quantile of the slopes.
+- ``"trailing_window"``: OLS on a trailing N-day window. v3 default.
+- ``"trailing_window_theilsen"``: Theil-Sen (median-of-pairwise-slopes) on
+  the same trailing N-day window. v7 default — substantially more robust
+  to bursty deliveries than OLS.
+- ``"trailing_window_qpairs"``: Lower-quantile of pairwise slopes
+  (``pair_quantile``) on the trailing window — generalises Theil-Sen to
+  arbitrary quantiles. With ``pair_quantile=0.30`` and matching higher
+  shrink (~0.80) this beats Theil-Sen on both CV folds. v8 default.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+from scipy.stats import theilslopes
 
 
 def _fit_yearly_slope(g: pd.DataFrame, use_only_active: bool, min_active_days: int) -> tuple[float, bool]:
@@ -47,22 +55,36 @@ def _fit_yearly_slope(g: pd.DataFrame, use_only_active: bool, min_active_days: i
 
 @dataclass
 class PerRMLinearForecaster:
-    fit_year: int  # most recent complete year — used for ``recent`` strategy or as the upper bound for ``quantile``
+    fit_year: int
     slope_shrink: float = 0.6
-    slope_strategy: str = "recent"  # "recent", "quantile", or "trailing_window"
-    n_years: int = 4  # for "quantile" strategy
-    quantile_tau: float = 0.5  # for "quantile" strategy
-    trailing_window_days: int = 180  # for "trailing_window" strategy
-    cutoff: pd.Timestamp | None = None  # required for "trailing_window"
+    slope_strategy: str = "recent"  # see module docstring for options
+    n_years: int = 4
+    quantile_tau: float = 0.5
+    trailing_window_days: int = 180
+    cutoff: pd.Timestamp | None = None
     use_only_active: bool = True
     min_active_days: int = 20
+    pair_quantile: float = 0.50          # for "trailing_window_qpairs"
+    pair_quantile_max_pairs: int = 200_000
+    pair_quantile_seed: int = 0
     fits: dict | None = None
 
     def fit(self, daily: pd.DataFrame) -> "PerRMLinearForecaster":
-        if self.slope_strategy not in ("recent", "quantile", "trailing_window"):
+        valid = (
+            "recent",
+            "quantile",
+            "trailing_window",
+            "trailing_window_theilsen",
+            "trailing_window_qpairs",
+        )
+        if self.slope_strategy not in valid:
             raise ValueError(f"unknown slope_strategy: {self.slope_strategy}")
 
-        if self.slope_strategy == "trailing_window":
+        if self.slope_strategy in (
+            "trailing_window",
+            "trailing_window_theilsen",
+            "trailing_window_qpairs",
+        ):
             if self.cutoff is None:
                 raise ValueError("trailing_window strategy requires `cutoff`")
             window_start = self.cutoff - pd.Timedelta(days=self.trailing_window_days)
@@ -70,6 +92,7 @@ class PerRMLinearForecaster:
             df = df.sort_values(["rm_id", "date"])
             df["t"] = (df["date"] - window_start).dt.days.astype(float)
             df["cum_kg"] = df.groupby("rm_id")["daily_kg"].cumsum()
+            rng = np.random.RandomState(self.pair_quantile_seed)
             fits: dict[int, tuple[float, bool]] = {}
             for rm_id, g in df.groupby("rm_id"):
                 cum = g["cum_kg"].to_numpy(dtype=float)
@@ -84,13 +107,38 @@ class PerRMLinearForecaster:
                 if x.size < 2:
                     fits[int(rm_id)] = (0.0, False)
                     continue
-                x_mean, y_mean = x.mean(), y.mean()
-                ss_xy = ((x - x_mean) * (y - y_mean)).sum()
-                ss_xx = ((x - x_mean) ** 2).sum()
-                if ss_xx == 0:
-                    fits[int(rm_id)] = (0.0, False)
-                    continue
-                fits[int(rm_id)] = (float(ss_xy / ss_xx), True)
+                if self.slope_strategy == "trailing_window_theilsen":
+                    try:
+                        slope, _, _, _ = theilslopes(y, x)
+                        slope = float(max(slope, 0.0))
+                    except Exception:
+                        fits[int(rm_id)] = (0.0, False)
+                        continue
+                    fits[int(rm_id)] = (slope, True)
+                elif self.slope_strategy == "trailing_window_qpairs":
+                    n = x.size
+                    i, j = np.triu_indices(n, k=1)
+                    if i.size > self.pair_quantile_max_pairs:
+                        sample = rng.choice(i.size, self.pair_quantile_max_pairs, replace=False)
+                        i = i[sample]
+                        j = j[sample]
+                    dx = x[j] - x[i]
+                    dy = y[j] - y[i]
+                    valid_mask = dx > 0
+                    if valid_mask.sum() < 1:
+                        fits[int(rm_id)] = (0.0, False)
+                        continue
+                    slopes = dy[valid_mask] / dx[valid_mask]
+                    slope = float(max(np.quantile(slopes, self.pair_quantile), 0.0))
+                    fits[int(rm_id)] = (slope, True)
+                else:
+                    x_mean, y_mean = x.mean(), y.mean()
+                    ss_xy = ((x - x_mean) * (y - y_mean)).sum()
+                    ss_xx = ((x - x_mean) ** 2).sum()
+                    if ss_xx == 0:
+                        fits[int(rm_id)] = (0.0, False)
+                        continue
+                    fits[int(rm_id)] = (float(ss_xy / ss_xx), True)
             self.fits = fits
             return self
 

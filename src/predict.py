@@ -31,6 +31,7 @@ from src.models.lgbm_quantile import LGBMQuantileForecaster, assemble_training_s
 from src.models.linear_per_rm import PerRMLinearForecaster
 from src.anchor import AnchorConfig, build_anchor, combine_with_slope
 from src.regime import classify_regime, shrink_per_rm
+from src.seasonality import SeasonalityConfig, build_shape_lookup, compute_shapes
 from src.validation import DEFAULT_FOLDS, build_query_for_fold, evaluate
 
 SUBMISSIONS_DIR = REPO_ROOT / "submissions"
@@ -49,16 +50,16 @@ DEFAULT_ENSEMBLE = EnsembleConfig(
     floor_zero=True,
 )
 
-# Per-track slope shrink, tuned on the joint walk-forward CV across
-# pretend-2023 and pretend-2024 with a 210-day trailing-window slope fit:
-# - A: 0.70 (high R^2, stable cohort)
-# - B: 0.70 (still active, more variable)
-# - C: 0.30 (sparse but had some H2 delivery; the small contribution helps
-#   recover loss on rm_ids that ramped up late and would otherwise score 0)
-DEFAULT_PER_TRACK_SHRINK = {"A": 0.70, "B": 0.70, "C": 0.30}
-# 210-day trailing window captures recent slope better than the full prior
-# year — critical for rm_ids that started or ramped up mid-year.
+# Per-track slope shrinks, tuned on the joint walk-forward CV.
+# v8 uses higher shrinks because the q=0.30 pairwise-slope estimator is
+# more conservative than Theil-Sen — the slope itself is smaller, so the
+# applied shrink can be larger without over-predicting.
+DEFAULT_PER_TRACK_SHRINK = {"A": 0.70, "B": 0.70, "C": 0.30}    # v3
+V7_PER_TRACK_SHRINK = {"A": 0.70, "B": 0.70, "C": 0.40}           # v7
+V8_PER_TRACK_SHRINK = {"A": 0.80, "B": 0.80, "C": 0.50}           # v8
+
 DEFAULT_TRAILING_WINDOW_DAYS = 210
+V8_PAIR_QUANTILE = 0.30
 
 
 @dataclass
@@ -75,8 +76,9 @@ def train_models_and_predict(
     target_year: int,
     end_dates: pd.DatetimeIndex,
     rm_ids: list[int],
+    model: str = "v8",
     per_track_shrink: dict[str, float] | None = None,
-    use_regime: bool = True,
+    use_regime: bool = False,
     use_anchor: bool = False,
     anchor_alpha: float = 0.65,
     use_lgbm: bool = False,
@@ -87,13 +89,18 @@ def train_models_and_predict(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Train the ensemble and predict for one cutoff/target combination.
 
-    When ``use_regime=True`` (default), per-rm shrink comes from the YoY
-    trend regime classifier (``src/regime.py``); otherwise the legacy
-    Track A/B/C per-track shrink is used.
+    ``model`` selects the slope estimator and the within-window shape:
+        - ``"v3"``: OLS slope on a 210-day trailing window, uniform shape.
+          Per-track shrink A=B=0.70, C=0.30.
+        - ``"v7"``: Theil-Sen slope (q=0.5 pairwise) + empirical seasonal shape.
+          Per-track shrink A=B=0.70, C=0.40.
+        - ``"v8"`` (default): Lower-quantile pairwise slope (q=0.30) + same
+          empirical seasonal shape. Per-track shrink A=B=0.80, C=0.50.
+          The q=0.30 slope is a more conservative estimator naturally aligned
+          with τ=0.2 pinball loss, allowing larger shrink without over-prediction.
 
-    When ``use_anchor=True`` (production-only — never CV), the slope-based
-    prediction is combined with a prior-year-Jan-May trajectory anchor via
-    ``max(slope_pred, alpha * prior_year_jan_may[doy])``.
+    Both models share the same gating and Track-D-zero behaviour.
+    Walk-forward CV (avg pinball, lower better): v3 9693, v7 9183, v8 8944.
     """
     daily_pre = ds.daily[ds.daily["date"] < history_end]
     profile = build_profile(daily_pre, year=target_year - 1)
@@ -113,14 +120,15 @@ def train_models_and_predict(
     emp = EmpiricalQuantileForecaster(tau=0.2, min_year=2020).fit(ds.daily, history_end=history_end)
     preds_emp = emp.predict(query)
 
-    # Per-rm shrink: per-track baseline (v3) + INTERMITTENT override.
-    # The full regime model (GROWING/STABLE/...) over-fits one fold and
-    # regresses the other. The INTERMITTENT class — rm_ids silent for 60+
-    # days with minimal recent activity — generalises across folds and
-    # consistently catches false-positive predictions like rm_id 2761
-    # (predicted ~110k, actual 0). So we keep the v3 per-track shrink and
-    # only apply the INTERMITTENT override on top.
-    shrinks = per_track_shrink or DEFAULT_PER_TRACK_SHRINK
+    # Default per-track shrink — picks v3/v7/v8 defaults if not overridden.
+    if per_track_shrink is not None:
+        shrinks = per_track_shrink
+    elif model == "v8":
+        shrinks = V8_PER_TRACK_SHRINK
+    elif model == "v7":
+        shrinks = V7_PER_TRACK_SHRINK
+    else:
+        shrinks = DEFAULT_PER_TRACK_SHRINK
     per_rm_shrink = {
         **{rm: shrinks.get("A", 0.7) for rm in track_a_ids},
         **{rm: shrinks.get("B", 0.7) for rm in track_b_ids},
@@ -131,25 +139,64 @@ def train_models_and_predict(
         intermittent_ids = set(
             regimes[regimes["regime"] == "INTERMITTENT"]["rm_id"].astype(int).tolist()
         )
-        # Drop intermittent rm_ids from the per-rm shrink dict — they will
-        # not appear in the forecast_active set and predict 0 by default.
         for rm in list(per_rm_shrink.keys()):
             if rm in intermittent_ids:
                 del per_rm_shrink[rm]
     forecast_active = set(per_rm_shrink.keys())
 
+    # Slope estimator: OLS for v3, Theil-Sen (q=0.5 pairwise) for v7,
+    # lower-quantile pairwise (q=0.30) for v8.
+    if model == "v8":
+        slope_strategy = "trailing_window_qpairs"
+    elif model == "v7":
+        slope_strategy = "trailing_window_theilsen"
+    else:
+        slope_strategy = "trailing_window"
     lin = PerRMLinearForecaster(
         fit_year=target_year - 1,
-        slope_strategy="trailing_window",
+        slope_strategy=slope_strategy,
         trailing_window_days=DEFAULT_TRAILING_WINDOW_DAYS,
         cutoff=history_end,
         slope_shrink=1.0,
+        pair_quantile=V8_PAIR_QUANTILE,
     ).fit(ds.daily)
-    preds_lin = lin.predict(
-        query,
-        rm_id_track_filter=forecast_active,
-        per_rm_shrink=per_rm_shrink,
-    )
+
+    if model in ("v7", "v8"):
+        # v7: empirical seasonal shape replaces uniform d/151. The May-31
+        # prediction is identical (slope × 151 × shrink); only intermediate
+        # end_dates change. Both folds improve when this is enabled.
+        per_rm_shape, global_shape, n_active_per_rm = compute_shapes(
+            ds.daily[ds.daily["date"] < history_end],
+            fit_year=target_year - 1,
+            cfg=SeasonalityConfig(),
+        )
+        shape_lookup = build_shape_lookup(
+            forecast_active, per_rm_shape, global_shape, n_active_per_rm, SeasonalityConfig()
+        )
+        # Build predictions manually: total_at_151 × shape(d).
+        slope_arr = np.array([
+            (lin.fits.get(int(rm), (0.0, False))[0]
+             if lin.fits.get(int(rm), (0.0, False))[1]
+             else 0.0)
+            for rm in query["rm_id"]
+        ])
+        shrink_arr = np.array([per_rm_shrink.get(int(rm), 0.0) for rm in query["rm_id"]])
+        active_mask = np.array([int(rm) in forecast_active for rm in query["rm_id"]])
+        total_pred = slope_arr * 151.0 * shrink_arr * active_mask
+        doys = query["forecast_end_date"].dt.dayofyear.to_numpy()
+        # Build shape value per row.
+        shape_vals = np.array([
+            shape_lookup.get(int(rm), global_shape)[int(d) - 1] if 1 <= int(d) <= 151 else 1.0
+            for rm, d in zip(query["rm_id"].to_numpy(), doys)
+        ])
+        preds_lin = query[["rm_id", "forecast_end_date"]].copy()
+        preds_lin["predicted_weight"] = np.maximum(0.0, total_pred * shape_vals)
+    else:
+        preds_lin = lin.predict(
+            query,
+            rm_id_track_filter=forecast_active,
+            per_rm_shrink=per_rm_shrink,
+        )
 
     model_preds: dict[str, pd.DataFrame] = {"empirical": preds_emp, "linear": preds_lin}
 
@@ -227,8 +274,9 @@ def train_models_and_predict(
 def cv_score(
     ds: Datasets,
     rm_ids: list[int],
+    model: str = "v8",
     per_track_shrink: dict[str, float] | None = None,
-    use_regime: bool = True,
+    use_regime: bool = False,
     use_lgbm: bool = False,
     use_nhits: bool = False,
     nhits_max_epochs: int = 30,
@@ -247,6 +295,7 @@ def cv_score(
             target_year=fold.target_year,
             end_dates=end_dates,
             rm_ids=rm_ids,
+            model=model,
             per_track_shrink=per_track_shrink,
             use_regime=use_regime,
             use_anchor=False,
@@ -264,8 +313,9 @@ def cv_score(
 
 def make_submission(
     ds: Datasets,
+    model: str = "v8",
     per_track_shrink: dict[str, float] | None = None,
-    use_regime: bool = True,
+    use_regime: bool = False,
     use_anchor: bool = False,
     anchor_alpha: float = 0.65,
     manual_overrides: dict[int, callable] | None = None,
@@ -287,6 +337,7 @@ def make_submission(
         target_year=2025,
         end_dates=end_dates,
         rm_ids=rm_ids,
+        model=model,
         per_track_shrink=per_track_shrink,
         use_regime=use_regime,
         use_anchor=use_anchor,
@@ -319,6 +370,7 @@ def make_submission(
     cv_scores = cv_score(
         ds=ds,
         rm_ids=rm_ids,
+        model=model,
         per_track_shrink=per_track_shrink,
         use_regime=use_regime,
         use_lgbm=use_lgbm,
@@ -364,36 +416,26 @@ def sanity_checks(submission: pd.DataFrame, detail: pd.DataFrame, prediction_map
 def main() -> None:
     """Build the production submission.
 
-    Reverted to the v3 configuration after v4 (regime + anchor + overrides)
-    showed a severe public/private LB divergence — public 4795 vs private
-    16956 — confirming overfitting to year-specific patterns that don't
-    generalize. v3 is the most robust configuration we have:
+    Default model is v8: lower-quantile pairwise slope (q=0.30) + empirical
+    seasonal shape, with per-track shrink A=B=0.80, C=0.50.
 
-      - Per-rm linear regression on a 210-day trailing-window slope
-      - Per-track shrink: A=0.70, B=0.70, C=0.30
-      - Track D: predict 0
-      - No INTERMITTENT regime override, no anchor, no manual overrides
-      - Monotonicity enforced
+    Walk-forward CV: avg pinball 8944 (v7 9183, v3 9693), p2023=9041,
+    p2024=8847. Both folds improve over v7 by ≥1%, fold gap 194 (v7 286,
+    v3 843).
 
-    The v4 modules (``src/regime.py``, ``src/anchor.py``, ``src/overrides.py``)
-    remain in the codebase for future experimentation but are NOT enabled
-    by default. To re-run v4 manually, call ``make_submission`` with
-    ``use_regime=True, use_anchor=True, manual_overrides=DEFAULT_OVERRIDES``.
+    v7 and v3 remain callable via ``model="v7"`` / ``model="v3"``.
     """
     ds = load_or_build()
-    run = make_submission(
-        ds=ds,
-        use_regime=False,
-        use_anchor=False,
-        manual_overrides=None,
-        per_track_shrink=DEFAULT_PER_TRACK_SHRINK,
-        label="v5_revert_to_v3",
-    )
+    run = make_submission(ds=ds, model="v8", label="v8_qpairs_seasonal")
     print("\nCV scores (lower is better):")
     for name, s in run.cv_scores.items():
         print(f"  {name}: pinball={s['mean_pinball']:.1f}")
     avg = sum(s["mean_pinball"] for s in run.cv_scores.values()) / len(run.cv_scores)
-    print(f"  average: pinball={avg:.1f}")
+    gap = abs(
+        run.cv_scores["pretend-2023"]["mean_pinball"]
+        - run.cv_scores["pretend-2024"]["mean_pinball"]
+    )
+    print(f"  average: pinball={avg:.1f}  gap={gap:.0f}")
     print("\nTrack distribution:")
     print(run.tracks["track"].value_counts().sort_index())
 
