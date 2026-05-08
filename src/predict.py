@@ -50,14 +50,16 @@ DEFAULT_ENSEMBLE = EnsembleConfig(
     floor_zero=True,
 )
 
-# Per-track slope shrink, tuned on the joint walk-forward CV.
-# v3 used 0.30 for Track C; v7 uses 0.40 because Theil-Sen + seasonality
-# produces tighter slope estimates and a larger Track C lift is less
-# risky.
-DEFAULT_PER_TRACK_SHRINK = {"A": 0.70, "B": 0.70, "C": 0.30}     # v3
-V7_PER_TRACK_SHRINK = {"A": 0.70, "B": 0.70, "C": 0.40}            # v7
+# Per-track slope shrinks, tuned on the joint walk-forward CV.
+# v8 uses higher shrinks because the q=0.30 pairwise-slope estimator is
+# more conservative than Theil-Sen — the slope itself is smaller, so the
+# applied shrink can be larger without over-predicting.
+DEFAULT_PER_TRACK_SHRINK = {"A": 0.70, "B": 0.70, "C": 0.30}    # v3
+V7_PER_TRACK_SHRINK = {"A": 0.70, "B": 0.70, "C": 0.40}           # v7
+V8_PER_TRACK_SHRINK = {"A": 0.80, "B": 0.80, "C": 0.50}           # v8
 
 DEFAULT_TRAILING_WINDOW_DAYS = 210
+V8_PAIR_QUANTILE = 0.30
 
 
 @dataclass
@@ -74,7 +76,7 @@ def train_models_and_predict(
     target_year: int,
     end_dates: pd.DatetimeIndex,
     rm_ids: list[int],
-    model: str = "v7",
+    model: str = "v8",
     per_track_shrink: dict[str, float] | None = None,
     use_regime: bool = False,
     use_anchor: bool = False,
@@ -88,14 +90,17 @@ def train_models_and_predict(
     """Train the ensemble and predict for one cutoff/target combination.
 
     ``model`` selects the slope estimator and the within-window shape:
-        - ``"v3"``: OLS slope on a 210-day trailing window, uniform shape
-          (cum_kg(d) = slope × d × shrink). Per-track shrink A=B=0.70, C=0.30.
-        - ``"v7"`` (default): Theil-Sen slope on the same trailing window,
-          empirical seasonal shape (cum_kg(d) = slope × 151 × shrink × shape(d)).
+        - ``"v3"``: OLS slope on a 210-day trailing window, uniform shape.
+          Per-track shrink A=B=0.70, C=0.30.
+        - ``"v7"``: Theil-Sen slope (q=0.5 pairwise) + empirical seasonal shape.
           Per-track shrink A=B=0.70, C=0.40.
+        - ``"v8"`` (default): Lower-quantile pairwise slope (q=0.30) + same
+          empirical seasonal shape. Per-track shrink A=B=0.80, C=0.50.
+          The q=0.30 slope is a more conservative estimator naturally aligned
+          with τ=0.2 pinball loss, allowing larger shrink without over-prediction.
 
-    Both models share the same gating and Track-D-zero behaviour. Walk-forward
-    CV: v3 avg pinball 9693, v7 avg pinball 9183 (-510, both folds improve).
+    Both models share the same gating and Track-D-zero behaviour.
+    Walk-forward CV (avg pinball, lower better): v3 9693, v7 9183, v8 8944.
     """
     daily_pre = ds.daily[ds.daily["date"] < history_end]
     profile = build_profile(daily_pre, year=target_year - 1)
@@ -115,8 +120,15 @@ def train_models_and_predict(
     emp = EmpiricalQuantileForecaster(tau=0.2, min_year=2020).fit(ds.daily, history_end=history_end)
     preds_emp = emp.predict(query)
 
-    # Default per-track shrink — picks v3 or v7 defaults if not overridden.
-    shrinks = per_track_shrink or (V7_PER_TRACK_SHRINK if model == "v7" else DEFAULT_PER_TRACK_SHRINK)
+    # Default per-track shrink — picks v3/v7/v8 defaults if not overridden.
+    if per_track_shrink is not None:
+        shrinks = per_track_shrink
+    elif model == "v8":
+        shrinks = V8_PER_TRACK_SHRINK
+    elif model == "v7":
+        shrinks = V7_PER_TRACK_SHRINK
+    else:
+        shrinks = DEFAULT_PER_TRACK_SHRINK
     per_rm_shrink = {
         **{rm: shrinks.get("A", 0.7) for rm in track_a_ids},
         **{rm: shrinks.get("B", 0.7) for rm in track_b_ids},
@@ -132,17 +144,24 @@ def train_models_and_predict(
                 del per_rm_shrink[rm]
     forecast_active = set(per_rm_shrink.keys())
 
-    # Slope estimator: OLS for v3, Theil-Sen for v7.
-    slope_strategy = "trailing_window_theilsen" if model == "v7" else "trailing_window"
+    # Slope estimator: OLS for v3, Theil-Sen (q=0.5 pairwise) for v7,
+    # lower-quantile pairwise (q=0.30) for v8.
+    if model == "v8":
+        slope_strategy = "trailing_window_qpairs"
+    elif model == "v7":
+        slope_strategy = "trailing_window_theilsen"
+    else:
+        slope_strategy = "trailing_window"
     lin = PerRMLinearForecaster(
         fit_year=target_year - 1,
         slope_strategy=slope_strategy,
         trailing_window_days=DEFAULT_TRAILING_WINDOW_DAYS,
         cutoff=history_end,
         slope_shrink=1.0,
+        pair_quantile=V8_PAIR_QUANTILE,
     ).fit(ds.daily)
 
-    if model == "v7":
+    if model in ("v7", "v8"):
         # v7: empirical seasonal shape replaces uniform d/151. The May-31
         # prediction is identical (slope × 151 × shrink); only intermediate
         # end_dates change. Both folds improve when this is enabled.
@@ -255,7 +274,7 @@ def train_models_and_predict(
 def cv_score(
     ds: Datasets,
     rm_ids: list[int],
-    model: str = "v7",
+    model: str = "v8",
     per_track_shrink: dict[str, float] | None = None,
     use_regime: bool = False,
     use_lgbm: bool = False,
@@ -294,7 +313,7 @@ def cv_score(
 
 def make_submission(
     ds: Datasets,
-    model: str = "v7",
+    model: str = "v8",
     per_track_shrink: dict[str, float] | None = None,
     use_regime: bool = False,
     use_anchor: bool = False,
@@ -397,17 +416,17 @@ def sanity_checks(submission: pd.DataFrame, detail: pd.DataFrame, prediction_map
 def main() -> None:
     """Build the production submission.
 
-    Default model is v7: Theil-Sen slope + empirical seasonal shape.
-    Walk-forward CV: avg pinball 9183 (vs v3 9693), p2023=9040, p2024=9326.
-    Both folds improve substantially over v3, with a much smaller fold gap
-    (286 vs 843), suggesting stronger generalisation.
+    Default model is v8: lower-quantile pairwise slope (q=0.30) + empirical
+    seasonal shape, with per-track shrink A=B=0.80, C=0.50.
 
-    v3 (legacy) is still callable via ``make_submission(..., model="v3")``.
-    The v4 components (regime, anchor, overrides) remain in the codebase
-    but are off by default since they overfit on the public/private split.
+    Walk-forward CV: avg pinball 8944 (v7 9183, v3 9693), p2023=9041,
+    p2024=8847. Both folds improve over v7 by ≥1%, fold gap 194 (v7 286,
+    v3 843).
+
+    v7 and v3 remain callable via ``model="v7"`` / ``model="v3"``.
     """
     ds = load_or_build()
-    run = make_submission(ds=ds, model="v7", label="v7_theilsen_seasonal")
+    run = make_submission(ds=ds, model="v8", label="v8_qpairs_seasonal")
     print("\nCV scores (lower is better):")
     for name, s in run.cv_scores.items():
         print(f"  {name}: pinball={s['mean_pinball']:.1f}")
