@@ -1,31 +1,41 @@
-"""Feature engineering for v9 (LightGBM quantile refinement).
+"""Feature builder for the v9 LightGBM correction model.
 
 Each row of the output frame is one (rm_id, forecast_end_date) pair. The
-target is cumulative kg from Jan 1 of ``target_year`` through ``forecast_end_date``.
-All features use **only** data with date < Jan 1 of target_year — zero
-target-year leakage.
+target is cumulative kg from Jan 1 of ``target_year`` through
+``forecast_end_date``. **All features use only data with date < Jan 1 of
+target_year** — zero target-year leakage.
 
-Features (~25):
+The 25 features are grouped by what they capture:
 
-Base (1):
-    v8_pred          : the v8 prediction at this row, used as a base
-                       which LightGBM can correct.
-Stable per-rm (8):
-    years_active_5y, total_kg_5y, mean_annual_5y, median_annual_5y,
-    std_annual_5y, cv_yearly_5y, mean_jan_may_5y, median_jan_may_5y.
-Recency (5):
-    sum_kg_30d, sum_kg_90d, sum_kg_180d, sum_kg_365d,
-    days_since_last_arrival.
+Base prediction (1):
+    ``v8_pred`` — the per-rm linear base prediction at this row. The
+    LightGBM correction is given the base as a feature and learns to
+    refine it, rather than predict from scratch.
+
+Stable per-rm (8) — long-term properties; nearly invariant across years:
+    ``years_active_5y``, ``total_kg_5y``, ``mean_annual_5y``,
+    ``median_annual_5y``, ``std_annual_5y``, ``cv_yearly_5y``,
+    ``mean_jan_may_5y``, ``median_jan_may_5y``.
+
+Recency (5) — recent activity over windows ending at the cutoff:
+    ``sum_kg_30d``, ``sum_kg_90d``, ``sum_kg_180d``, ``sum_kg_365d``,
+    ``days_since_last_arrival``.
+
 Calendar (4):
-    doy, days_into_window, month, day_of_week.
-Materials (2, categorical):
-    raw_material_alloy, raw_material_format_type.
-Cross-rm pooling (3):
-    alloy_group_v8_pred_mean, format_group_v8_pred_mean, alloy_group_size.
+    ``doy``, ``days_into_window``, ``month``, ``day_of_week``.
 
-The v8 predictor is injected so the same code path runs in CV (with the
-proper history cutoff per fold) and in production. No production-only
-behaviour — this is the discipline that v4 broke.
+Materials (2 — categorical):
+    ``raw_material_alloy``, ``raw_material_format_type``.
+
+Cross-rm pooling (3) — let the model borrow strength across similar rm_ids:
+    ``alloy_group_v8_pred_mean`` (mean of v8_pred for same alloy at this
+    end_date), ``format_group_v8_pred_mean`` (same for format type),
+    ``alloy_group_size``.
+
+The base predictor is **injected** as a callable so the same code path
+runs in CV (with the proper history cutoff per fold) and in production.
+There is no production-only behaviour anywhere in this module — the
+discipline that v4 broke and v6+ enforces.
 """
 
 from __future__ import annotations

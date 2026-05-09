@@ -1,12 +1,30 @@
-"""v9 — LightGBM quantile regression refining v8 predictions.
+"""LightGBM quantile-regression correction model — the v9 second stage.
 
 Trained on flattened (rm_id, end_date) rows from prior years' Jan-May
-windows, with the v8 prediction as a feature. The model learns *corrections*
-to v8 using stable cross-rm features and alloy/format pooling.
+windows, with the per-rm linear base prediction as one of the features.
+The model learns small *corrections* on top of the base, not the raw
+target — which means a tiny ensemble weight (20% in production) is enough
+to extract value, and the model can't pull predictions wildly off the
+base anchor.
 
-Key discipline: every feature is computed using only data with date < Jan 1
-of target_year — no leakage from the year being predicted. The v8 predictor
-is recomputed at each year's history cutoff so its features are also clean.
+Walk-forward CV: pure LightGBM scores ~14k pinball alone. Blended at
+80/20 with the per-rm linear base, the ensemble drops to 8394 — a
+clean -550 vs the base alone.
+
+Discipline:
+- Features are computed using only data with ``date < Jan 1 of target_year``;
+  no leakage from the year being predicted. The base predictor is
+  re-computed at each training-year's history cutoff so its features
+  are themselves clean.
+- Sample weight is ``√(rm_id's prior-year total kg + 1)``. Without this
+  the model would optimise unweighted mean pinball loss and ignore the
+  high-volume rm_ids that actually move the leaderboard.
+- Training rows are restricted to Track A/B/C (active rm_ids). Including
+  Track D's 148 always-zero rm_ids would drag the quantile output toward
+  zero everywhere.
+
+Hyper-parameters in ``V9Params`` are hand-tuned; an Optuna sweep of 25
+trials couldn't beat them.
 """
 
 from __future__ import annotations
@@ -37,17 +55,27 @@ def _coerce_categoricals(df: pd.DataFrame) -> pd.DataFrame:
 
 @dataclass
 class V9Params:
+    """LightGBM training hyper-parameters for the v9 correction model.
+
+    Defaults are LightGBM's common quantile-regression starting point;
+    production overrides ``learning_rate`` to 0.04 (see ``src/predict.py``).
+
+    The strict ``min_data_in_leaf=50`` and small ``num_leaves=31`` are
+    deliberate: with only ~120k training rows and a quantile loss, looser
+    settings overfit fast and CV regresses.
+    """
+
     objective: str = "quantile"
-    alpha: float = TAU
+    alpha: float = TAU                  # τ=0.20, matching the leaderboard metric
     metric: str = "quantile"
     learning_rate: float = 0.05
     num_leaves: int = 31
-    min_data_in_leaf: int = 50
+    min_data_in_leaf: int = 50          # leaves with < 50 rows give degenerate quantile estimates
     feature_fraction: float = 0.85
     bagging_fraction: float = 0.85
     bagging_freq: int = 5
     lambda_l2: float = 1.0
-    num_boost_round: int = 1500
+    num_boost_round: int = 1500         # cap; early stopping ends training earlier
     early_stopping_rounds: int = 100
     verbose: int = -1
     seed: int = 0
@@ -72,14 +100,36 @@ def _to_lgb_params(p: V9Params) -> dict:
 
 @dataclass
 class V9Trainer:
-    """Build training data, fit LightGBM, predict on target year.
+    """Build training data, fit LightGBM, predict on the target year.
 
-    Workflow:
-        1. ``assemble_training_set(...)`` — build features+target for each
-           train year and concat.
-        2. ``fit(...)`` — train LightGBM with quantile loss.
-        3. ``predict(...)`` — apply the trained model to a feature frame
-           built for ``target_year``.
+    Three-step workflow:
+        1. ``assemble_training_set(train_years)`` — for each year y, build
+           features using data ``< Jan 1 of y`` and target = actual
+           cumulative kg from Jan 1 of y. Concat across years.
+        2. ``fit(X, y, sample_weight, valid_X, valid_y)`` — train LightGBM
+           with quantile loss; early-stop on the validation fold.
+        3. ``build_inference(target_year, end_dates)`` then ``predict(X)``
+           — apply the trained model to the inference feature frame.
+
+    Attributes
+    ----------
+    daily, materials : the dataset frames (passed through to features_v9).
+    rm_ids : list of rm_ids to *train* on (Track A/B/C only); inference
+        is on the full set passed to ``build_inference``.
+    v8_predictor : closure that returns the per-rm linear base prediction
+        for any (history_end, target_year, end_dates, rm_ids) — used as
+        a feature inside ``build_features_v9``.
+    params : ``V9Params`` controlling LightGBM training.
+    booster, feature_cols : populated after ``fit``.
+
+    Example
+    -------
+    >>> tr = V9Trainer(daily, materials, rm_ids, v8_predictor)
+    >>> X, y, w = tr.assemble_training_set([2020, 2021, 2022])
+    >>> val = tr.build_validation(2023)
+    >>> tr.fit(X, y, w, valid_X=val.features, valid_y=val.target)
+    >>> inf = tr.build_inference(2024, end_dates)
+    >>> preds = tr.predict(inf.features)
     """
 
     daily: pd.DataFrame

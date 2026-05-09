@@ -1,12 +1,22 @@
 """Data loading and daily aggregation per rm_id.
 
-Reads the raw CSVs in ``data/`` and produces:
-- ``daily``: a long frame with (rm_id, date, daily_kg) for every day from
-  ``HISTORY_START`` to the last receival in 2024, zero-filled per rm_id.
-- ``profile_2024``: one row per rm_id summarising 2024 behaviour, used by
-  ``src.gating`` to decide which model track each rm_id is forecast on.
+Reads the raw CSVs in ``data/`` and produces three artefacts wrapped in
+the ``Datasets`` dataclass:
 
-Cached in parquet form under ``data/processed/`` for fast reload.
+- ``daily``: a long frame with (rm_id, date, daily_kg) for every day from
+  ``HISTORY_START`` (2019-01-01) to the last receival in the data,
+  zero-filled per rm_id. Zero-fill is essential — without it cumulative
+  sums and trailing windows would skip empty days, mis-counting averages.
+- ``profile_2024``: one row per rm_id summarising calendar-year-2024
+  behaviour. ``src.gating`` consumes this to decide which Track each
+  rm_id forecasts on.
+- ``materials``: a slim alloy + format_type frame keyed by rm_id, used as
+  categorical features for the LightGBM correction model.
+- ``prediction_mapping``: the (ID → rm_id, end_date) submission grid.
+
+The first call rebuilds from raw CSVs; subsequent calls hit a parquet
+cache under ``data/processed/`` for fast reload. Pass ``force=True`` to
+rebuild the cache.
 """
 
 from __future__ import annotations
@@ -36,19 +46,46 @@ FORECAST_END = pd.Timestamp(f"{FORECAST_YEAR}-05-31")
 
 @dataclass
 class Datasets:
-    daily: pd.DataFrame  # columns: rm_id, date, daily_kg
-    profile_2024: pd.DataFrame  # one row per rm_id, summary stats over 2024
-    materials: pd.DataFrame  # rm_id, raw_material_alloy, raw_material_format_type
-    prediction_mapping: pd.DataFrame  # ID, rm_id, forecast_start_date, forecast_end_date
+    """Bundle of the four frames used everywhere downstream.
+
+    Attributes
+    ----------
+    daily : DataFrame [rm_id, date, daily_kg]
+        Zero-filled daily total kg per rm_id over a continuous date range
+        from 2019-01-01 onward. Every (rm_id, date) pair exists.
+    profile_2024 : DataFrame [rm_id, total_kg, n_active_days, n_active_months,
+                              monthly_cv, last_arrival, had_h2_delivery, linear_r2]
+        One row per rm_id summarising calendar-year-2024 deliveries.
+        Used by ``src.gating.assign_tracks`` to classify rm_ids.
+    materials : DataFrame [rm_id, raw_material_alloy, raw_material_format_type]
+        Slim materials metadata. Used as categorical features.
+    prediction_mapping : DataFrame [ID, rm_id, forecast_start_date, forecast_end_date]
+        The submission grid — every (rm_id × end_date) the leaderboard scores.
+    """
+
+    daily: pd.DataFrame
+    profile_2024: pd.DataFrame
+    materials: pd.DataFrame
+    prediction_mapping: pd.DataFrame
 
 
 def _parse_arrival_date(series: pd.Series) -> pd.Series:
-    # Tolerate the "+02:00" trailing tz; we just want the local calendar date.
+    """Parse ``date_arrival`` to local Oslo calendar date.
+
+    The raw CSV stores timestamps like ``"2024-06-15 13:34:00 +02:00"``.
+    We want the *local calendar date* (one of 365 days) for grouping, so:
+    parse as UTC, convert to Europe/Oslo, drop the time component.
+    """
     parsed = pd.to_datetime(series, utc=True, errors="coerce")
     return parsed.dt.tz_convert("Europe/Oslo").dt.normalize().dt.tz_localize(None)
 
 
 def load_receivals(path: Path | None = None) -> pd.DataFrame:
+    """Load and clean ``data/kernel/receivals.csv``.
+
+    Returns the raw row-level data with a parsed ``date`` column. The
+    daily aggregation happens later in ``build_daily``.
+    """
     path = path or KERNEL_DIR / "receivals.csv"
     df = pd.read_csv(path)
     df["date"] = _parse_arrival_date(df["date_arrival"])
