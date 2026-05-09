@@ -1,10 +1,19 @@
-"""Pinball (quantile) loss at tau=0.2 — the competition metric.
+"""Pinball (quantile) loss at τ=0.20 — the competition metric.
 
-The asymmetric loss penalises over-prediction 4x more than under-prediction:
+The asymmetric quantile loss penalises over-prediction **4× more** than
+under-prediction (0.8 vs 0.2 per unit at τ=0.2):
 
-    QuantileLoss_0.2(F, A) = max(0.2 * (A - F), 0.8 * (F - A))
+    QuantileLoss_τ(F, A) = max( τ × (A − F),  (τ − 1) × (A − F) )
+                         = max( 0.2 × (A − F),  0.8 × (F − A) )    when τ=0.2
 
-The optimal point forecast is the 20th percentile of the predictive distribution.
+The optimal point forecast under this loss is the **τ-quantile** of the
+predictive distribution — i.e. for τ=0.2, the 20th percentile. Models
+should systematically bias predictions *low* relative to the mean.
+
+This module is the single source of truth for the metric across CV scoring,
+walk-forward validation, and any ad-hoc model evaluations. The constant
+``TAU`` is imported by ``src.models.lgbm_v9`` to set LightGBM's
+``alpha=TAU`` (a custom quantile-loss objective at the same τ).
 """
 
 from __future__ import annotations
@@ -12,17 +21,25 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-TAU = 0.2
+TAU = 0.2  # Competition metric — never change without coordinating downstream.
 
 
 def pinball_loss(forecast: np.ndarray, actual: np.ndarray, tau: float = TAU) -> np.ndarray:
+    """Per-row pinball loss between forecast and actual.
+
+    Returns the same-shape array of losses. Aggregate over rows externally
+    (mean for the leaderboard metric, sum for total-error analyses, etc.).
+    """
     forecast = np.asarray(forecast, dtype=float)
     actual = np.asarray(actual, dtype=float)
     diff = actual - forecast
+    # Under-pred (diff > 0): cost = tau * diff. Over-pred (diff < 0): cost = -(1-tau) * diff.
+    # The max() form unifies both branches.
     return np.maximum(tau * diff, (tau - 1.0) * diff)
 
 
 def mean_pinball(forecast: np.ndarray, actual: np.ndarray, tau: float = TAU) -> float:
+    """Mean pinball loss — the leaderboard metric (averaged over all rows)."""
     return float(pinball_loss(forecast, actual, tau).mean())
 
 

@@ -1,9 +1,21 @@
 """Walk-forward cross-validation that mirrors the real submission window.
 
-Two folds: pretend-2023 (train ≤ 2022-12-31, score 2023 Jan-May) and
-pretend-2024 (train ≤ 2023-12-31, score 2024 Jan-May). Pretend-2024 is
-the held-out fold — tune on pretend-2023, evaluate once on pretend-2024
-to estimate true generalization.
+The competition asks for a 2025 Jan-May forecast given history through
+2024-12-19. To score model changes locally we run two **walk-forward**
+folds:
+
+- **pretend-2023**: train on data ≤ 2022-12-31, score against the actual
+  2023 Jan-May cumulative. Same shape as the real submission, just
+  shifted back two years.
+- **pretend-2024**: train on data ≤ 2023-12-31, score against 2024 Jan-May.
+
+Walk-forward (vs random K-fold) is mandatory for time-series CV — random
+splits would leak future information through the rm_id × time
+correlations and give an over-optimistic score.
+
+Discipline: every change must improve **both** folds (or at least not
+regress one by more than 2%). A change that wins one fold and loses the
+other is a year-specific bet, not a generalisable improvement.
 """
 
 from __future__ import annotations
@@ -19,11 +31,19 @@ from src.metric import mean_pinball
 
 @dataclass
 class Fold:
+    """A single walk-forward CV fold.
+
+    ``train_end`` is inclusive: training data is restricted to ``date < train_end + 1 day``
+    (i.e. the model never sees anything from ``target_year`` onward).
+    ``target_year`` is the year whose Jan-May actuals we score against.
+    """
+
     name: str
-    train_end: pd.Timestamp  # inclusive — training data is date < train_end + 1 day
-    target_year: int  # the year whose Jan-May we score against
+    train_end: pd.Timestamp
+    target_year: int
 
 
+# Two folds covering the most recent two complete years.
 DEFAULT_FOLDS: list[Fold] = [
     Fold(name="pretend-2023", train_end=pd.Timestamp("2022-12-31"), target_year=2023),
     Fold(name="pretend-2024", train_end=pd.Timestamp("2023-12-31"), target_year=2024),

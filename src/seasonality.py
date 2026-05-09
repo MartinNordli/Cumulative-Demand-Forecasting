@@ -34,6 +34,21 @@ JAN_MAY_LAST_DOY = 151
 
 @dataclass
 class SeasonalityConfig:
+    """Hyper-parameters for the empirical Jan-May shape.
+
+    Attributes
+    ----------
+    n_years : how many recent years to average the shape over (5 = the
+        last 5 complete years before the forecast year).
+    blend_min_years : an rm_id needs at least this many years of valid
+        Jan-May data to use its own shape; otherwise we fall back to the
+        global shape.
+    blend_strength : when an rm_id qualifies for its own shape, the final
+        shape is ``(1 - strength) × global + strength × own``. 0.8 in
+        production — bias toward the rm-specific pattern but keep some
+        regularisation toward the population.
+    """
+
     n_years: int = 5
     blend_min_years: int = 4
     blend_strength: float = 0.8
